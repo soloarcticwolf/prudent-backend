@@ -81,6 +81,26 @@ class JobManager:
         fields["updated_at"] = utcnow().isoformat()
         await DB.collection("analysis_jobs").update_one({"job_id": job_id}, {"$set": fields})
 
+    async def _mirror(
+        self, job_id: str, progress: List[str], state: Dict[str, Any]
+    ) -> None:
+        """Persist live stage fractions so the progress bar tracks real events.
+
+        Runs alongside the pipeline; cancelled when the pipeline finishes.
+        Fractions come only from completed pipeline stages — never simulated.
+        """
+        try:
+            while True:
+                await asyncio.sleep(1.5)
+                await self._set(
+                    job_id,
+                    status="processing",
+                    progress=list(progress),
+                    progress_pct=float(state.get("pct", 12.0)),
+                )
+        except asyncio.CancelledError:
+            pass
+
     async def _requeue_interrupted(self) -> None:
         """Recovery: requeue jobs left queued/processing by a previous worker."""
         try:
@@ -105,18 +125,24 @@ class JobManager:
                 doc = await self.get(job_id)
                 if doc is None or doc["status"] in TERMINAL:
                     continue
-                await self._set(job_id, status="processing", progress=["Queued", "Processing"], progress_pct=15.0)
+                await self._set(job_id, status="processing", progress=["Queued", "Processing"], progress_pct=12.0)
                 req = doc["request"]
                 progress: List[str] = ["Queued", "Processing"]
-                result = await asyncio.wait_for(
-                    run_pipeline(
-                        req["region_id"], req["start_year"], req["end_year"],
-                        req.get("hazard", "heatwave"),
-                        req.get("baseline_start", 1991), req.get("baseline_end", 2020),
-                        progress=progress,
-                    ),
-                    timeout=get_settings().JOB_TIMEOUT_S,
-                )
+                state: Dict[str, Any] = {"pct": 12.0}
+                mirror = asyncio.create_task(self._mirror(job_id, progress, state))
+                try:
+                    result = await asyncio.wait_for(
+                        run_pipeline(
+                            req["region_id"], req["start_year"], req["end_year"],
+                            req.get("hazard", "heatwave"),
+                            req.get("baseline_start", 1991), req.get("baseline_end", 2020),
+                            progress=progress,
+                            progress_state=state,
+                        ),
+                        timeout=get_settings().JOB_TIMEOUT_S,
+                    )
+                finally:
+                    mirror.cancel()
                 status = "completed_with_warnings" if result.get("warnings") else "completed"
                 await self._set(job_id, status=status, progress=progress,
                                 progress_pct=100.0, analysis_id=result["analysis_id"],

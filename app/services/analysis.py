@@ -67,8 +67,13 @@ async def run_pipeline(
     baseline_start: int = BASELINE_START_DEFAULT,
     baseline_end: int = BASELINE_END_DEFAULT,
     progress: Optional[List[str]] = None,
+    progress_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     prog = progress if progress is not None else []
+
+    def _pct(frac: float) -> None:
+        if progress_state is not None:
+            progress_state["pct"] = frac
     region = await resolve_region(region_id)
     if region is None:
         raise ValueError(f"unknown region {region_id}")
@@ -87,6 +92,7 @@ async def run_pipeline(
     cache_key = build_cache_key(params)
 
     prog.append("Checking available data")
+    _pct(15.0)
     cached = await DB.collection("analysis_results").find_one({"cache_key": cache_key})
     if cached:
         return cached["result"]
@@ -116,6 +122,13 @@ async def run_pipeline(
          "inside_stored_boundary": point_in_polygon(p[0], p[1], bnd["geometry"])}
         for p in used
     ]
+    # Retrieval dominates wall time: 15% -> 70% spread across every fetch.
+    n_fetches = 2 * len(used)
+    done = 0
+
+    def _retrieval_pct() -> None:
+        _pct(15.0 + 55.0 * done / max(n_fetches, 1))
+
     per_point = []
     fetch_log: List[Dict[str, Any]] = []
     for lon, lat in used:
@@ -134,6 +147,8 @@ async def run_pipeline(
             "rejected": int(fetched.get("rejected", 0)),
             "fields": fetched.get("fields_consumed", ["temperature_2m_max"]),
         })
+        done += 1
+        _retrieval_pct()
     # Baseline uses the SAME points and aggregation as the analysis series
     # (heatwave-v2; v1 used the centroid only — a spatial mismatch).
     base_fetch_log: List[Dict[str, Any]] = []
@@ -153,11 +168,14 @@ async def run_pipeline(
             "missing": sum(1 for r in rows if r.get("tmax_c") is None),
             "rejected": int(fetched.get("rejected", 0)),
         })
+        done += 1
+        _retrieval_pct()
     base_responded_at = max(f["responded_at"] for f in base_fetch_log)
     base_requested_at = min(f["requested_at"] for f in base_fetch_log)
     base = {"series": area_weighted_mean(base_per_point),
             "rejected": sum(f["rejected"] for f in base_fetch_log)}
     prog.append("Validating data coverage")
+    _pct(72.0)
     combined = area_weighted_mean(per_point)
     if not combined:
         raise RuntimeError("provider returned no usable observations for this region/period")
@@ -165,6 +183,7 @@ async def run_pipeline(
     base_obs = [DailyObs(day=date.fromisoformat(r["date"]), tmax_c=r.get("tmax_c")) for r in base["series"]]
 
     prog.append("Detecting heatwave events")
+    _pct(78.0)
     thresholds, thr_meta = calculate_thresholds(base_obs)
     if thr_meta["days_with_threshold"] < 200:
         raise RuntimeError(
@@ -173,6 +192,7 @@ async def run_pipeline(
     events, det_info = detect_events(obs, thresholds)
 
     prog.append("Calculating annual trends")
+    _pct(88.0)
     annual = aggregate_annual(obs, events, date(start_year, 1, 1), date(end_year, 12, 31))
     years = [a["year"] for a in annual if not a["incomplete"]]
     trends = {
@@ -257,6 +277,7 @@ async def run_pipeline(
         "created_at": created_at,
     }
     prog.append("Preparing results")
+    _pct(96.0)
     await DB.collection("analysis_results").insert_one({"_id": analysis_id, "cache_key": cache_key, "result": result, "created_at": result["created_at"]})
     # Immutable run record: refreshes never rewrite this run's history.
     await DB.collection("provenance_runs").insert_one(

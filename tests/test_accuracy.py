@@ -140,3 +140,28 @@ def test_v2_baseline_and_accounting(client):
     assert det["spatial"]["sampling_note"]
     # Full-index completeness present.
     assert all("missing_days" in a for a in res["annual"])
+
+
+async def test_pipeline_reports_monotonic_stage_fractions(monkeypatch):
+    """Progress fractions track real completed stages (never simulated)."""
+
+    async def fake_fetch(lat, lon, start, end, client=None):
+        return _fake_series(lat, lon, start, end)
+
+    monkeypatch.setattr(analysis_mod, "fetch_daily_tmax", fake_fetch)
+    from app.services.analysis import run_pipeline
+
+    progress: list = []
+    state: dict = {}
+    res = await run_pipeline("geo:paris-fr", 2000, 2002, progress=progress, progress_state=state)
+    assert res["methodology_version"] == "heatwave-v2"
+    assert progress == [
+        "Checking available data",
+        "Retrieving historical observations",
+        "Validating data coverage",
+        "Detecting heatwave events",
+        "Calculating annual trends",
+        "Preparing results",
+    ]
+    # Final reported fraction is the last completed stage (worker writes 100).
+    assert state["pct"] == 96.0
