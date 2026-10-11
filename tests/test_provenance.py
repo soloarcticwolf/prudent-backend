@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.services.analysis as analysis_mod
+from app.db import DB
 from app.main import create_app
 from app.services.provenance import LEGACY_NOTICE, provenance_status
 
@@ -137,3 +138,12 @@ def test_legacy_results_flagged_honestly():
     assert provenance_status({}) == "legacy"
     assert provenance_status({"provenance_detail": {"schema_version": "other"}}) == "legacy"
     assert "not fully captured" in LEGACY_NOTICE
+
+
+async def test_provenance_run_record_carries_indexed_run_id(client):
+    # Regression: the unique index is on field run_id, so the stored doc must
+    # contain it — memory backends don't enforce uniqueness, real Mongo does.
+    res = _run(client, _payload())
+    doc = await DB.collection("provenance_runs").find_one({"_id": res["run_id"]})
+    assert doc is not None
+    assert doc.get("run_id") == res["run_id"]

@@ -281,7 +281,7 @@ async def run_pipeline(
     await DB.collection("analysis_results").insert_one({"_id": analysis_id, "cache_key": cache_key, "result": result, "created_at": result["created_at"]})
     # Immutable run record: refreshes never rewrite this run's history.
     await DB.collection("provenance_runs").insert_one(
-        {"_id": run_id, "analysis_id": analysis_id, "created_at": created_at,
+        {"_id": run_id, "run_id": run_id, "analysis_id": analysis_id, "created_at": created_at,
          "provenance": det.model_dump()})
     # Persist annual metrics + events (chunked, indexed).
     for a in annual:
