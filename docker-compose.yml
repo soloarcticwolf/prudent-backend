@@ -1,0 +1,35 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: prudent
+      MONGO_INITDB_ROOT_PASSWORD: prudent-dev
+      MONGO_INITDB_DATABASE: prudent
+    ports:
+      - "27017:27017"
+    volumes:
+      - prudent-mongo:/data/db
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    environment:
+      APP_ENV: development
+      MONGODB_URI: mongodb://prudent:prudent-dev@mongo:27017/prudent?authSource=admin
+      MONGODB_DB: prudent
+      FRONTEND_ORIGINS: http://localhost:5173
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+volumes:
+  prudent-mongo:
