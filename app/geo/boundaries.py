@@ -95,3 +95,32 @@ def simplify_coords(coords: Any, step: int = 2) -> Any:
 
 def display_geometry(geom: Dict[str, Any]) -> Dict[str, Any]:
     return {"type": geom["type"], "coordinates": simplify_coords(geom["coordinates"], 2)}
+
+
+def _ring_contains(ring: Any, lon: float, lat: float) -> bool:
+    """Ray-casting point-in-ring test."""
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(ring[i][0]), float(ring[i][1])
+        xj, yj = float(ring[j][0]), float(ring[j][1])
+        if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def point_in_polygon(lon: float, lat: float, geom: Dict[str, Any]) -> bool:
+    """True when the point lies inside the polygon exterior and no hole."""
+    gtype = geom.get("type")
+    coords = geom.get("coordinates", [])
+    polys = coords if gtype == "MultiPolygon" else [coords]
+    for poly in polys:
+        if not poly:
+            continue
+        if _ring_contains(poly[0], lon, lat) and not any(
+            _ring_contains(hole, lon, lat) for hole in poly[1:]
+        ):
+            return True
+    return False

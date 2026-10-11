@@ -11,6 +11,7 @@ from app.climate.openmeteo import (
 )
 from app.config import get_settings
 from app.db import DB
+from app.geo.boundaries import point_in_polygon
 from app.hazards.registry import get_hazard
 from app.science.heatwave import (
     BASELINE_END_DEFAULT, BASELINE_START_DEFAULT, DailyObs,
@@ -23,7 +24,7 @@ from app.services.provenance import (
 from app.utils.hashing import sha256_hex, utcnow
 
 AGGREGATION_METHOD = "sampled-area-mean-v1"
-METHODOLOGY_VERSION = "heatwave-v1"
+METHODOLOGY_VERSION = "heatwave-v2"
 
 
 def build_cache_key(params: Dict[str, Any]) -> str:
@@ -93,9 +94,31 @@ async def run_pipeline(
     prog.append("Retrieving historical observations")
     cache_checked_at = utcnow().isoformat()
     points = sample_points(region["bbox"], [region["centroid"]["lon"], region["centroid"]["lat"]])
+    # Containment vs the stored boundary polygon (accuracy audit §6).
+    containment = [point_in_polygon(lon, lat, bnd["geometry"]) for lon, lat in points]
+    if region.get("approximate"):
+        # Preview geometries are display-only approximations: documented
+        # bounding-box-interior sampling applies; containment is reported.
+        used = points
+        sampling_note = (
+            "Bounding-box-interior sampling: the stored boundary is a simplified "
+            "preview, so samples target the bbox interior; containment vs the "
+            "preview polygon is reported, not enforced."
+        )
+    else:
+        used = [p for p, inside in zip(points, containment) if inside]
+        if not used:
+            used = [points[0]]
+        sampling_note = "Samples constrained to the stored boundary polygon."
+    dropped = len(points) - len(used)
+    spatial_points = [
+        {"lon": p[0], "lat": p[1],
+         "inside_stored_boundary": point_in_polygon(p[0], p[1], bnd["geometry"])}
+        for p in used
+    ]
     per_point = []
     fetch_log: List[Dict[str, Any]] = []
-    for lon, lat in points:
+    for lon, lat in used:
         requested_at = utcnow()
         fetched = await fetch_daily_tmax(lat, lon, date(start_year, 1, 1), date(end_year, 12, 31))
         responded_at = utcnow()
@@ -111,13 +134,29 @@ async def run_pipeline(
             "rejected": int(fetched.get("rejected", 0)),
             "fields": fetched.get("fields_consumed", ["temperature_2m_max"]),
         })
-    # Baseline fetch uses centroid only (threshold climatology).
-    base_requested_at = utcnow()
-    base = await fetch_daily_tmax(
-        region["centroid"]["lat"], region["centroid"]["lon"],
-        date(baseline_start, 1, 1), date(baseline_end, 12, 31),
-    )
-    base_responded_at = utcnow()
+    # Baseline uses the SAME points and aggregation as the analysis series
+    # (heatwave-v2; v1 used the centroid only — a spatial mismatch).
+    base_fetch_log: List[Dict[str, Any]] = []
+    base_per_point = []
+    for lon, lat in used:
+        requested_at = utcnow()
+        fetched = await fetch_daily_tmax(lat, lon, date(baseline_start, 1, 1), date(baseline_end, 12, 31))
+        responded_at = utcnow()
+        base_per_point.append(fetched["series"])
+        rows = fetched["series"]
+        base_fetch_log.append({
+            "lon": lon, "lat": lat,
+            "requested_at": requested_at.isoformat(),
+            "responded_at": responded_at.isoformat(),
+            "retrieved": len(rows) + int(fetched.get("rejected", 0)),
+            "accepted": sum(1 for r in rows if r.get("tmax_c") is not None),
+            "missing": sum(1 for r in rows if r.get("tmax_c") is None),
+            "rejected": int(fetched.get("rejected", 0)),
+        })
+    base_responded_at = max(f["responded_at"] for f in base_fetch_log)
+    base_requested_at = min(f["requested_at"] for f in base_fetch_log)
+    base = {"series": area_weighted_mean(base_per_point),
+            "rejected": sum(f["rejected"] for f in base_fetch_log)}
     prog.append("Validating data coverage")
     combined = area_weighted_mean(per_point)
     if not combined:
@@ -134,7 +173,7 @@ async def run_pipeline(
     events, det_info = detect_events(obs, thresholds)
 
     prog.append("Calculating annual trends")
-    annual = aggregate_annual(obs, events)
+    annual = aggregate_annual(obs, events, date(start_year, 1, 1), date(end_year, 12, 31))
     years = [a["year"] for a in annual if not a["incomplete"]]
     trends = {
         "event_count": ols_trend(years, [a["event_count"] if not a["incomplete"] else None for a in annual]),
@@ -144,11 +183,18 @@ async def run_pipeline(
         "annual": annual, "trends": trends, "start_year": start_year, "end_year": end_year,
     })
 
+    partial_days = sum(1 for r in combined if r.get("n_points", len(used)) < len(used))
     warnings: List[str] = []
     if region.get("approximate"):
         warnings.append("Boundary is a simplified preview; regional estimate is approximate.")
+    if dropped and not region.get("approximate"):
+        warnings.append(
+            f"{dropped} sample point(s) fell outside the stored boundary and were excluded.")
     if any(a["incomplete"] for a in annual):
         warnings.append("The analysis completed, but some years were excluded because of missing observations.")
+    if partial_days:
+        warnings.append(
+            f"{partial_days} day(s) have partial spatial coverage (fewer sample points reporting).")
     if thr_meta["days_insufficient"] > 0:
         warnings.append(f"{thr_meta['days_insufficient']} calendar days lacked stable thresholds.")
     warnings.append("Coarse reanalysis resolution cannot describe street-level conditions.")
@@ -157,7 +203,7 @@ async def run_pipeline(
     run_id = "run_" + uuid.uuid4().hex[:12]
     created_at = utcnow().isoformat()
     retrieved_at = max(
-        [f["responded_at"] for f in fetch_log] + [base_responded_at.isoformat()]
+        [f["responded_at"] for f in fetch_log] + [base_responded_at]
     )
     det = _build_provenance_detail(
         run_id=run_id,
@@ -166,11 +212,12 @@ async def run_pipeline(
         baseline_start=baseline_start, baseline_end=baseline_end,
         fetch_log=fetch_log,
         base_series=base["series"],
-        base_rejected=int(base.get("rejected", 0)),
-        base_requested_at=base_requested_at.isoformat(),
-        base_responded_at=base_responded_at.isoformat(),
+        base_fetch_log=base_fetch_log,
+        base_requested_at=base_requested_at,
+        base_responded_at=base_responded_at,
         combined=combined, obs=obs, base_obs=base_obs,
-        points=points, thresholds_meta=thr_meta,
+        points=used, spatial_points=spatial_points, sampling_note=sampling_note,
+        partial_days=partial_days, thresholds_meta=thr_meta,
         events=events, annual=annual, trends=trends,
         cache_checked_at=cache_checked_at,
         retrieved_at=retrieved_at, completed_at=created_at,
@@ -203,7 +250,8 @@ async def run_pipeline(
             "boundary": bnd["provenance"],
             "dataset": {"provider": "open-meteo", "version": DATASET_VERSION,
                         "attribution": "Historical reanalysis via Open-Meteo archive API (ERA5 family)."},
-            "methodology": "Prudent heatwave-v1: 95th pct calendar-day threshold, >=3 consecutive days.",
+            "methodology": (f"Prudent {METHODOLOGY_VERSION}: 95th pct calendar-day threshold, "
+                            ">=3 consecutive days, baseline sampled as the analysis series."),
         },
         "provenance_detail": det.model_dump(),
         "created_at": created_at,
@@ -237,13 +285,16 @@ def _build_provenance_detail(
     baseline_end: int,
     fetch_log: List[Dict[str, Any]],
     base_series: List[Dict[str, Any]],
-    base_rejected: int,
+    base_fetch_log: List[Dict[str, Any]],
     base_requested_at: str,
     base_responded_at: str,
     combined: List[Dict[str, Any]],
     obs: List[Any],
     base_obs: List[Any],
     points: List[List[float]],
+    spatial_points: List[Dict[str, Any]],
+    sampling_note: str,
+    partial_days: int,
     thresholds_meta: Dict[str, Any],
     events: List[Dict[str, Any]],
     annual: List[Dict[str, Any]],
@@ -258,8 +309,10 @@ def _build_provenance_detail(
     for f in fetch_log:
         for k in tot:
             tot[k] += int(f[k])
-    base_acc = sum(1 for r in base_series if r.get("tmax_c") is not None)
-    base_mis = sum(1 for r in base_series if r.get("tmax_c") is None)
+    btot = {"retrieved": 0, "accepted": 0, "missing": 0, "rejected": 0}
+    for f in base_fetch_log:
+        for k in btot:
+            btot[k] += int(f[k])
 
     climate_source = {
         "source_id": "openmeteo-archive",
@@ -267,7 +320,7 @@ def _build_provenance_detail(
         "dataset": "ERA5-family reanalysis archive",
         "role": "analytical",
         "endpoint": s.OPENMETEO_BASE_URL,
-        "operation": "GET daily=temperature_2m_max (per sampled point + baseline centroid)",
+        "operation": "GET daily=temperature_2m_max (per sampled point, analysis period)",
         "fields_consumed": ["temperature_2m_max"],
         "units_provider": "celsius",
         "units_used": "celsius",
@@ -286,6 +339,17 @@ def _build_provenance_detail(
         "license": "Subject to Open-Meteo provider terms; see dataset documentation.",
         "website": "https://open-meteo.com/",
         "docs_url": "https://open-meteo.com/en/docs/historical-weather-api",
+        "baseline": {
+            "period": f"{baseline_start}-01-01 to {baseline_end}-12-31",
+            "sampling": "same points and aggregation as the analysis series (heatwave-v2)",
+            "requested_at": base_requested_at,
+            "responded_at": base_responded_at,
+            "retrieved": btot["retrieved"],
+            "accepted": btot["accepted"],
+            "missing": btot["missing"],
+            "rejected": btot["rejected"],
+            "fingerprint": sha256_hex({"series": base_series}),
+        },
     }
 
     if region_id.startswith("geo:"):
@@ -379,12 +443,16 @@ def _build_provenance_detail(
         "methodology_version": METHODOLOGY_VERSION,
         "baseline": {"start": baseline_start, "end": baseline_end},
         "baseline_days": len(base_series),
+        "baseline_sampling": "same points and aggregation as analysis series (heatwave-v2)",
         "min_obs": thresholds_meta.get("min_baseline_obs"),
         "threshold_days": thresholds_meta.get("days_with_threshold"),
         "threshold_missing": thresholds_meta.get("days_insufficient"),
         "event_count": len(events),
         "annual_years": len(annual),
         "incomplete_years": len(incomplete),
+        "completeness_rule": "valid days vs the full expected date index per year; <80% valid is incomplete",
+        "sampling_note": sampling_note,
+        "partial_days": partial_days,
     }
     lineage_ctx = {
         "total_events": len(events),
@@ -408,9 +476,13 @@ def _build_provenance_detail(
         metric_lineage=heatwave_metric_lineage(lineage_ctx),
         spatial={
             "strategy": "sampled-area-mean-v1",
-            "points": [{"lon": p[0], "lat": p[1], "weight": round(1.0 / len(points), 4)} for p in points],
+            "points": [{**sp, "weight": round(1.0 / len(points), 4)} for sp in spatial_points],
             "n_points": len(points),
-            "note": "Equal-weight daily mean across interior sample points; an estimate, not a measurement.",
+            "containment": (f"{sum(1 for sp in spatial_points if sp['inside_stored_boundary'])}/"
+                            f"{len(spatial_points)} used points inside the stored boundary"),
+            "sampling_note": sampling_note,
+            "partial_coverage_days": partial_days,
+            "note": "Equal-weight daily mean across used sample points; an estimate, not a measurement.",
         },
         software={
             "methodology_version": METHODOLOGY_VERSION,

@@ -48,6 +48,7 @@ class SourceRecord(BaseModel):
     website: str = ""
     docs_url: str = ""
     notes: str = ""
+    baseline: Dict[str, Any] = {}
 
 
 class StageRecord(BaseModel):
@@ -105,7 +106,7 @@ LEGACY_NOTICE = (
 
 
 def heatwave_stages(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Lineage stages for the heatwave-v1 pipeline from the run context."""
+    """Lineage stages for the heatwave pipeline from the run context."""
     bl = ctx["baseline"]
     return [
         {
@@ -134,17 +135,21 @@ def heatwave_stages(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
             "stage_id": "aggregation",
             "title": "Geographic aggregation",
             "input": f"Per-point series inside boundary {ctx['boundary_version']}.",
-            "transformation": "Deterministic interior sampling (centroid + offsets) with equal-weight daily mean.",
-            "parameters": f"{ctx['n_points']} points; strategy sampled-area-mean-v1; coarse-resolution limits disclosed.",
+            "transformation": "Deterministic interior sampling (centroid + offsets) with equal-weight daily mean. "
+                              + ctx.get("sampling_note", ""),
+            "parameters": f"{ctx['n_points']} points used; strategy sampled-area-mean-v1; "
+                          f"{ctx.get('partial_days', 0)} days with partial spatial coverage; "
+                          "coarse-resolution limits disclosed.",
             "output": "One regional daily Tmax series representing the selected boundary (an estimate, not a measurement).",
             "contributes_to": ["heatwave_events", "heatwave_days", "mean_duration", "trend", "boundary_highlight"],
         },
         {
             "stage_id": "thresholds",
             "title": "Local percentile thresholds",
-            "input": f"Baseline {bl['start']}-{bl['end']} centroid daily Tmax ({ctx['baseline_days']} days).",
+            "input": f"Baseline {bl['start']}-{bl['end']} daily Tmax ({ctx['baseline_days']} combined days).",
             "transformation": "Calendar-day 95th percentile with ±7-day pooling (linear interpolation); "
-                              "Feb 29 mapped to Feb 28.",
+                              "Feb 29 mapped to Feb 28. Baseline uses the same sample points and "
+                              "aggregation as the analysis series.",
             "parameters": f"Percentile 95.0; window ±7 days; minimum {ctx['min_obs']} pooled obs; "
                           f"methodology {ctx['methodology_version']}.",
             "output": f"{ctx['threshold_days']} calendar days with stable thresholds; "
@@ -166,8 +171,10 @@ def heatwave_stages(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
             "title": "Annual statistics",
             "input": "Detected events + regional daily series.",
             "transformation": "Events allocated to the year of their start date; per-year counts, day totals, "
-                              "duration stats, completeness = valid/total days.",
-            "parameters": "Completeness rule: years with <80% valid days flagged incomplete and excluded from trends.",
+                              "duration stats, completeness = valid days vs the full expected date index.",
+            "parameters": "Completeness rule: years with <80% of expected days valid are flagged incomplete "
+                          "and excluded from trends; a year is never complete merely because its surviving "
+                          "filtered dates all have values.",
             "output": f"{ctx['annual_years']} annual records; {ctx['incomplete_years']} flagged incomplete.",
             "contributes_to": ["heatwave_events", "heatwave_days", "mean_duration", "trend"],
         },
@@ -199,7 +206,7 @@ def heatwave_metric_lineage(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
         {
             "metric": "heatwave_events",
             "kind": "derived",
-            "derivation": "Count of qualifying events detected under heatwave-v1: >=3 consecutive valid days "
+            "derivation": "Count of qualifying events detected under the reported methodology version: >=3 consecutive valid days "
                           "above the calendar-day 95th percentile.",
             "inputs": ["temperature_2m_max (daily max, °C)", "calendar-day thresholds", "consecutive-day grouping"],
         },

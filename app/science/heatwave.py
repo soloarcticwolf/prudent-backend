@@ -1,22 +1,25 @@
 """Heatwave threshold + detection + annual aggregation + trends + insights.
 
-Methodology version: heatwave-v1
-- Baseline: 1991-2020 preferred (configurable).
+Methodology version: heatwave-v2
+- Baseline: 1991-2020 preferred (configurable), sampled with the SAME spatial
+  points and aggregation as the analysis series (v1 used the centroid only).
 - Threshold: calendar-day 95th percentile over a +/-7 day window.
 - Event: >=3 consecutive valid days with Tmax > threshold.
 - Missing observations break runs (never bridged), never treated as zero.
+- Annual completeness is measured against the full expected date index,
+  not the filtered set of dates that survived aggregation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import stats
 
-METHODOLOGY_VERSION = "heatwave-v1"
+METHODOLOGY_VERSION = "heatwave-v2"
 BASELINE_START_DEFAULT = 1991
 BASELINE_END_DEFAULT = 2020
 WINDOW_RADIUS_DAYS = 7
@@ -131,7 +134,18 @@ def detect_events(
 def aggregate_annual(
     obs: List[DailyObs],
     events: List[Dict[str, Any]],
+    start: Optional[date] = None,
+    end: Optional[date] = None,
 ) -> List[Dict[str, Any]]:
+    """Annual aggregation. When start/end are given, completeness is measured
+    against the full expected date index: a year is never classified complete
+    merely because every date remaining in a filtered dataset has a value."""
+    expected: Dict[int, int] = {}
+    if start is not None and end is not None:
+        d = start
+        while d <= end:
+            expected[d.year] = expected.get(d.year, 0) + 1
+            d += timedelta(days=1)
     by_year: Dict[int, List[DailyObs]] = {}
     for o in obs:
         by_year.setdefault(o.day.year, []).append(o)
@@ -140,10 +154,11 @@ def aggregate_annual(
         y = int(str(e["start"])[:4])
         ev_by_year.setdefault(y, []).append(e)
     out: List[Dict[str, Any]] = []
-    for year in sorted(by_year):
-        days = by_year[year]
+    for year in sorted(set(list(by_year) + list(expected))):
+        days = by_year.get(year, [])
         valid = sum(1 for d in days if d.tmax_c is not None)
-        completeness = round(valid / len(days), 4) if days else 0.0
+        total = expected.get(year, len(days))
+        completeness = round(valid / total, 4) if total else 0.0
         evs = ev_by_year.get(year, [])
         durations = [e["duration_days"] for e in evs]
         peaks = [e["peak_tmax_c"] for e in evs]
@@ -155,7 +170,8 @@ def aggregate_annual(
             "max_duration_days": int(max(durations)) if durations else None,
             "peak_tmax_c": round(max(peaks), 2) if peaks else None,
             "valid_days": valid,
-            "total_days": len(days),
+            "total_days": total,
+            "missing_days": total - len(days),
             "completeness": completeness,
             # Incomplete years (<80% valid) are flagged; callers must not treat them as zero-event years.
             "incomplete": completeness < 0.80,
@@ -267,23 +283,34 @@ def build_insights(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             })
     t = trends.get("heatwave_days") or {}
     if t.get("supported"):
+        sig = ""
+        try:
+            sig = "" if float(t.get("p_value", 1.0)) < 0.05 else " (not statistically significant at the 5% level)"
+        except (TypeError, ValueError):
+            sig = ""
         insights.append({
             "type": "trend",
             "metric": "heatwave_days",
             "text": (
                 f"Estimated trend in annual heatwave days is {t['slope_per_year']:+.3f} days/yr "
                 f"(n={t['n_years']}, p={t.get('p_value', float('nan')):.3g}), "
-                f"about {t.get('modeled_change', 0):+.1f} days over the interval."
+                f"about {t.get('modeled_change', 0):+.1f} days over the interval{sig}."
             ),
             "detail": {"slope": t["slope_per_year"], "p": t.get("p_value"), "n": t["n_years"]},
         })
-    peak = max(valid, key=lambda a: a["event_count"])
-    if peak["event_count"] > 0:
+    peak_count = max([a["event_count"] for a in valid] + [0])
+    if peak_count > 0:
+        peak_years = sorted(a["year"] for a in valid if a["event_count"] == peak_count)
+        if len(peak_years) == 1:
+            text = f"{peak_years[0]} had the most heatwave events ({peak_count}) in {start}–{end}."
+        else:
+            text = (f"{', '.join(str(y) for y in peak_years)} tied for the most heatwave events "
+                    f"({peak_count}) in {start}–{end}.")
         insights.append({
             "type": "peak-year",
             "metric": "event_count",
-            "text": f"{peak['year']} had the most heatwave events ({peak['event_count']}) in {start}–{end}.",
-            "detail": {"year": peak["year"], "count": peak["event_count"]},
+            "text": text,
+            "detail": {"years": peak_years, "count": peak_count},
         })
     incomplete = [a for a in annual if a.get("incomplete")]
     if incomplete:

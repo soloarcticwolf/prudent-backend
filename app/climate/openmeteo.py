@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import random
+import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +14,25 @@ from app.config import get_settings
 
 DATASET_VERSION = "openmeteo-archive-v1"
 PROVIDER_ID = "open-meteo"
+
+# Provider rate-limit compliance: the free archive API enforces a minutely
+# request budget. All fetches share this throttle (min gap between upstream
+# calls) and honor 429 Retry-After instead of hammering retries.
+_MIN_GAP_S = 7.0
+_om_lock = asyncio.Lock()
+_last_call_ts = 0.0
+
+
+async def _throttled_get(client: httpx.AsyncClient, url: str, params: Dict[str, Any]) -> httpx.Response:
+    global _last_call_ts
+    async with _om_lock:
+        wait = _MIN_GAP_S - (time.monotonic() - _last_call_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            return await client.get(url, params=params)
+        finally:
+            _last_call_ts = time.monotonic()
 
 
 async def fetch_daily_tmax(
@@ -34,10 +56,9 @@ async def fetch_daily_tmax(
         client = httpx.AsyncClient(timeout=s.OPENMETEO_TIMEOUT_S, follow_redirects=False)
     assert client is not None
     last_err: Exception | None = None
-    import asyncio, random
-    for attempt in range(3):
+    for attempt in range(4):
         try:
-            r = await client.get(s.OPENMETEO_BASE_URL, params=params)
+            r = await _throttled_get(client, s.OPENMETEO_BASE_URL, params=params)
             r.raise_for_status()
             if len(r.content) > 8_000_000:
                 raise ValueError("upstream response too large")
@@ -65,6 +86,19 @@ async def fetch_daily_tmax(
                 "units": "celsius",
                 "fields_consumed": ["temperature_2m_max"],
             }
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            if e.response.status_code == 429:
+                # Minutely budget exceeded: back off for the provider's
+                # requested window instead of retrying into the limit.
+                retry_after = e.response.headers.get("retry-after")
+                try:
+                    delay = max(float(retry_after), 60.0) if retry_after else 65.0
+                except ValueError:
+                    delay = 65.0
+                await asyncio.sleep(delay + random.uniform(0, 5))
+            else:
+                await asyncio.sleep((0.6 * (2 ** attempt)) + random.uniform(0, 0.4))
         except Exception as e:  # bounded retry with jitter
             last_err = e
             await asyncio.sleep((0.6 * (2 ** attempt)) + random.uniform(0, 0.4))
